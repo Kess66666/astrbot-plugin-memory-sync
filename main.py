@@ -1,146 +1,192 @@
 """
-跨实例记忆同步插件 (Memory Sync Bridge)。
+跨实例记忆同步插件 (Memory Sync Bridge) - v1.1.0
 功能：监控本地 learnings 目录，将新增或变更的经验记录通过 A2A 协议同步到远程 AstrBot 实例。
-
-配置项 (config.yaml):
-  - remote_a2a_url: 远程 A2A 接收地址 (默认: http://192.168.100.1:6185/api/plug/astrbot_plugin_a2a_gateway/api/a2a/proxy)
-  - remote_token: 认证 Token (默认: my_secure_token_2026)
-  - learnings_dir: 本地监控目录 (默认: /AstrBot/data/learnings/)
-  - sync_interval: 轮询间隔秒数 (默认: 30)
+改进：增加内容 Hash 去重、重试机制、优雅退出、过滤规则。
 """
 
 import os
 import time
 import asyncio
+import hashlib
 import aiohttp
 from astrbot.api.all import *
 
 logger = logging.getLogger("AstrBot.memory_sync_bridge")
 
+# 默认配置
+DEFAULT_CONFIG = {
+    "remote_a2a_url": "http://192.168.100.1:6185/api/plug/astrbot_plugin_a2a_gateway/api/a2a/proxy",
+    "remote_token": "my_secure_token_2026",
+    "learnings_dir": "/AstrBot/data/learnings/",
+    "sync_interval": 30,
+    "file_filter": "*.md",
+    "content_max_length": 3000,
+    "retry_count": 3
+}
 
-@register("astrbot_plugin_memory_sync", "记忆同步桥接", "1.0.0", "door")
+@register("astrbot_plugin_memory_sync", "记忆同步桥接", "1.1.0", "door")
 class MemorySyncBridge(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context, config)
         self.context = context
-        self.config = config or {}
+        self.config = {**DEFAULT_CONFIG, **(config or {})}
         
-        # 从配置读取参数，或使用默认值
-        self.learnings_dir = self.config.get("learnings_dir", "/AstrBot/data/learnings/")
-        self.remote_a2a_url = self.config.get("remote_a2a_url", "http://192.168.100.1:6185/api/plug/astrbot_plugin_a2a_gateway/api/a2a/proxy")
-        self.remote_token = self.config.get("remote_token", "my_secure_token_2026")
-        self.sync_interval = int(self.config.get("sync_interval", 30))
+        self.learnings_dir = self.config["learnings_dir"]
+        self.remote_a2a_url = self.config["remote_a2a_url"]
+        self.remote_token = self.config["remote_token"]
+        self.sync_interval = int(self.config["sync_interval"])
+        self.retry_count = int(self.config["retry_count"])
         
-        self.watched_files = {}  # 记录 {filepath: mtime}，用于去重
+        # 记录 {filepath: {"mtime": float, "hash": str}}
+        self.watched_files = {} 
+        self.running = True
+        self.sync_task = None
         
         # 确保监控目录存在
         if not os.path.exists(self.learnings_dir):
             os.makedirs(self.learnings_dir, exist_ok=True)
             
-        logger.info(f"🕊️ 记忆同步桥接插件已启动。监控目录: {self.learnings_dir}，目标地址: {self.remote_a2a_url}，间隔: {self.sync_interval}s")
+        logger.info(f"🕊️ 记忆同步桥接 v1.1.0 启动。目标: {self.remote_a2a_url}")
         
         # 启动后台轮询任务
-        asyncio.create_task(self.sync_loop())
+        self.sync_task = asyncio.create_task(self.sync_loop())
+
+    async def terminate(self):
+        """插件卸载/重载时的清理逻辑"""
+        logger.info("🛑 正在停止记忆同步任务...")
+        self.running = False
+        if self.sync_task:
+            self.sync_task.cancel()
+            try:
+                await self.sync_task
+            except asyncio.CancelledError:
+                pass
 
     async def sync_loop(self):
-        logger.info(f"⏳ 记忆同步轮询循环已启动 (间隔 {self.sync_interval}s)。")
-        # 初始化当前状态，避免启动时全量轰炸
+        logger.info(f"⏳ 轮询循环启动 (间隔 {self.sync_interval}s)。")
         await self._scan_current_files()
         
-        while True:
+        while self.running:
             try:
                 await self.check_for_new_memories()
             except Exception as e:
                 logger.error(f"同步循环异常: {e}")
             await asyncio.sleep(self.sync_interval)
 
+    def _calc_hash(self, content: str) -> str:
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
     async def _scan_current_files(self):
-        """扫描现有文件并记录时间戳"""
         if not os.path.exists(self.learnings_dir): return
-        for f in os.listdir(self.learnings_dir):
-            if f.endswith(".md"):
+        import fnmatch
+        all_files = os.listdir(self.learnings_dir)
+        
+        for f in all_files:
+            if fnmatch.fnmatch(f, self.config.get("file_filter", "*.md")):
                 path = os.path.join(self.learnings_dir, f)
-                self.watched_files[path] = os.path.getmtime(path)
-        logger.info(f"📂 已索引 {len(self.watched_files)} 个现有记忆文件。")
+                try:
+                    with open(path, 'r', encoding='utf-8') as fp:
+                        content = fp.read()
+                    self.watched_files[path] = {
+                        "mtime": os.path.getmtime(path),
+                        "hash": self._calc_hash(content)
+                    }
+                except Exception as e:
+                    logger.warning(f"扫描 {f} 失败: {e}")
+        logger.info(f"📂 已索引 {len(self.watched_files)} 个文件指纹。")
 
     async def check_for_new_memories(self):
-        """检查新增或修改的文件"""
         if not os.path.exists(self.learnings_dir): return
+        import fnmatch
 
-        current_files = {}
         try:
-            for f in os.listdir(self.learnings_dir):
-                if f.endswith(".md"):
-                    path = os.path.join(self.learnings_dir, f)
-                    current_files[path] = os.path.getmtime(path)
+            current_files = os.listdir(self.learnings_dir)
         except Exception as e:
             logger.warning(f"扫描目录失败: {e}")
             return
 
-        for path, mtime in current_files.items():
-            last_mtime = self.watched_files.get(path, 0)
-            
-            # 如果修改时间变新了
-            if mtime > last_mtime:
-                logger.info(f"📝 发现记忆变更: {os.path.basename(path)}")
-                await self.process_and_send(path)
-                self.watched_files[path] = mtime
+        for f in current_files:
+            if not fnmatch.fnmatch(f, self.config.get("file_filter", "*.md")):
+                continue
+                
+            path = os.path.join(self.learnings_dir, f)
+            try:
+                mtime = os.path.getmtime(path)
+                last_record = self.watched_files.get(path, {})
+                last_mtime = last_record.get("mtime", 0)
+                
+                # 如果修改时间变新了，再算 Hash 确认内容是否真的变了
+                if mtime > last_mtime:
+                    with open(path, 'r', encoding='utf-8') as fp:
+                        content = fp.read()
+                    
+                    current_hash = self._calc_hash(content)
+                    last_hash = last_record.get("hash", "")
+                    
+                    if current_hash != last_hash:
+                        logger.info(f"📝 发现真实变更: {f}")
+                        # 发送成功后才更新记录，失败则下次重试
+                        if await self.process_and_send(path, content):
+                            self.watched_files[path] = {"mtime": mtime, "hash": current_hash}
+            except Exception as e:
+                logger.warning(f"检查 {f} 时出错: {e}")
 
-    async def process_and_send(self, file_path):
-        """读取文件并通过 A2A 发送"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            filename = os.path.basename(file_path)
-            # 提取摘要（取前 100 字或第一行）
-            summary = content.split('\n')[0] if content else "无标题"
-            if len(summary) > 100: summary = summary[:100] + "..."
-            
-            # 构造 A2A Payload
-            payload = {
-                "jsonrpc": "2.0",
-                "id": f"mem-sync-{int(time.time())}",
-                "method": "message",
-                "params": {
-                    "message": {
-                        "role": "user",
-                        "content": (
-                            f"🚨 **[SYSTEM_SYNC: MEMORY_UPDATE]**\n"
-                            f"👤 **Source**: Door (N100 Debian)\n"
-                            f"📂 **File**: {filename}\n"
-                            f"📝 **Summary**: {summary}\n\n"
-                            f"📄 **Content**:\n```markdown\n{content[:3000]}\n```\n\n"
-                            f"[指令] 请接收此记忆并归档到你的本地知识库中。"
-                        )
-                    }
+    async def process_and_send(self, file_path: str, content: str) -> bool:
+        filename = os.path.basename(file_path)
+        summary = content.split('\n')[0][:100] + "..." if content else "无标题"
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": f"mem-sync-{int(time.time())}",
+            "method": "message",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "content": (
+                        f"🚨 **[SYSTEM_SYNC: MEMORY_UPDATE]**\n"
+                        f"👤 **Source**: Door (N100 Debian)\n"
+                        f"📂 **File**: {filename}\n"
+                        f"📝 **Summary**: {summary}\n\n"
+                        f"📄 **Content**:\n```markdown\n{content[:self.config['content_max_length']]}\n```\n\n"
+                        f"[指令] 请 Pinna 接收此记忆并归档。"
+                    )
                 }
             }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.remote_token}"
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.remote_a2a_url, json=payload, headers=headers, timeout=10) as resp:
-                    if resp.status == 200:
-                        logger.info(f"✅ 记忆已成功同步: {filename}")
-                    else:
-                        text = await resp.text()
-                        logger.error(f"❌ 同步失败: {resp.status} - {text}")
-                        
-        except Exception as e:
-            logger.error(f"处理文件 {file_path} 失败: {e}")
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.remote_token}"
+        }
+        
+        # 重试机制
+        for attempt in range(self.retry_count):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.remote_a2a_url, json=payload, headers=headers, timeout=10) as resp:
+                        if resp.status == 200:
+                            logger.info(f"✅ 同步成功: {filename}")
+                            return True
+                        else:
+                            text = await resp.text()
+                            logger.error(f"❌ 远端拒绝: {resp.status} - {text}")
+                            return False # 远端明确拒绝，不重试
+            except Exception as e:
+                logger.warning(f"⏳ 同步失败 (尝试 {attempt+1}/{self.retry_count}): {e}")
+                await asyncio.sleep(2 ** attempt) # 指数退避
+        
+        logger.error(f"💀 同步彻底失败: {filename}")
+        return False
 
     @command("sync_test")
     async def cmd_sync_test(self, event: AstrMessageEvent):
-        """手动触发一次同步测试"""
-        yield event.make_result().message("🧪 开始同步测试... 请观察日志。")
+        yield event.make_result().message("🧪 开始同步测试...")
         test_file = os.path.join(self.learnings_dir, "SYNC_TEST_TEMP.md")
+        content = f"# Sync Test\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n手动测试"
         with open(test_file, 'w') as f:
-            f.write("# Sync Test\n这是一次手动触发的同步测试。")
+            f.write(content)
+            
+        success = await self.process_and_send(test_file, content)
+        if os.path.exists(test_file): os.remove(test_file)
         
-        await self.process_and_send(test_file)
-        os.remove(test_file)
-        yield event.make_result().message("✅ 测试完成。")
+        yield event.make_result().message("✅ 测试完成。" if success else "❌ 测试失败，请检查日志。")

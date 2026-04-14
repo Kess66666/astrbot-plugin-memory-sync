@@ -1,0 +1,5 @@
+name: astrbot_plugin_memory_sync
+desc: 跨实例记忆同步插件，通过 A2A 协议将本地 learnings 目录的经验记录同步到远程 AstrBot 实例。
+version: 1.0.0
+author: door
+repo: https://github.com/Kess66666/astrbot-plugin-memory-sync
